@@ -1,0 +1,126 @@
+#include <stdlib.h>
+#include <stdio.h>
+#include "ArduCAM.h"
+#include "sccb_bus.h"
+#include <unistd.h>
+#include <string.h>
+
+void captureAndSaveImage(int camera_id);
+
+#define IMAGE_SAVE_PATH "/your/save/location" // Path where images will be saved
+#define MAX_JPEG_SIZE 1024*1024*2 // Adjust size as needed
+
+int main(int argc, char *argv[]) {
+    char inputKey;
+
+    pioInit();
+    ArduCAM_CS_init(CAM_CS1, -1, -1, -1); // Initialize the CS for one camera
+    sccb_bus_init();
+    spiInit(4000000, 0); // Initialize SPI at 4MHz
+    Arducam_bus_detect(CAM_CS1, -1, -1, -1); // Detect SPI bus
+    resetFirmware(CAM_CS1, -1, -1, -1); // Reset firmware
+    ArduCAM_Init(OV5642);
+	// Set the highest resolution before starting capture
+    OV5642_set_JPEG_size(OV5642_2592x1944);
+    printf("Set the resolution to OV5642_2592x1944 successfully\r\n");
+
+    // Configure sensor settings
+
+    printf("Press 'Enter' to capture an image, 'q' to quit.\n");
+
+    while(1) {
+        inputKey = getchar(); // Wait for user input
+        if(inputKey == '\n') {
+            printf("Capturing image...\n");
+            captureAndSaveImage(CAM_CS1); // Capture and save image
+        } else if(inputKey == 'q') {
+            printf("Quitting...\n");
+            break; // Exit loop
+        }
+    }
+
+    return 0;
+}
+
+void captureAndSaveImage(int camera_id) {
+	static int image_count = 0; // Static variable to keep track of image count
+    printf("Starting image capture...\n");
+
+    flush_fifo(camera_id);
+    start_capture(camera_id);
+
+    while (!get_bit(ARDUCHIP_TRIG, CAP_DONE_MASK, camera_id));
+
+    unsigned int length = read_fifo_length(camera_id);
+    if (length >= MAX_JPEG_SIZE) {
+        printf("Error: Image size too large for buffer\n");
+        return;
+    }
+
+    printf("Captured image size: %u bytes\n", length);
+
+    unsigned char *imageBuffer = (unsigned char*)malloc(length);
+    if (!imageBuffer) {
+        printf("Failed to allocate memory for image buffer\n");
+        return;
+    }
+
+    // SPI read operation
+    CS_LOW(camera_id);
+    set_fifo_burst(); // Set FIFO burst mode
+
+    unsigned char temp_last = 0, temp = 0;
+    int is_header = 0;
+    int i = 0; // Index for imageBuffer
+
+    while (length--) {
+        temp_last = temp;
+        temp = spiSendReceive(0x00);
+
+        // If we find the JPEG header, set the flag and start collecting data
+        if ((temp == 0xD8) && (temp_last == 0xFF)) {
+            is_header = 1; // 'true' replaced with '1'
+            imageBuffer[i++] = temp_last;
+            imageBuffer[i++] = temp;
+        } else if ((temp == 0xD9) && (temp_last == 0xFF)) {
+            // If we find the EOI marker, we stop reading
+            imageBuffer[i++] = temp_last;
+            imageBuffer[i++] = temp;
+            // Update the length to reflect the actual data size
+            length = 0;
+            break;
+        } else if (is_header) {
+            // Collect the data
+            imageBuffer[i++] = temp;
+        }
+    }
+
+    CS_HIGH(camera_id);
+
+    // Verify if JPEG header was found
+    if (!is_header || i < 2 || imageBuffer[i-2] != 0xFF || imageBuffer[i-1] != 0xD9) {
+        printf("JPEG header not found or EOI marker missing!\n");
+        free(imageBuffer);
+        return;
+    }
+
+    // Update length to the actual number of bytes read
+    length = i;
+
+    char filename[100];
+    // Use the image_count in the filename, increment after using it
+    sprintf(filename, "%simage_%03d.jpg", IMAGE_SAVE_PATH, image_count++); // Create file path with sequential number
+
+    FILE *file = fopen(filename, "wb");
+    if (file == NULL) {
+        printf("Failed to open file for writing at %s\n", filename);
+        free(imageBuffer);
+        return;
+    }
+
+    fwrite(imageBuffer, 1, length, file);
+    fclose(file);
+    free(imageBuffer);
+
+    printf("Image successfully captured and saved as %s\n", filename);
+}
